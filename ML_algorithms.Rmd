@@ -1,0 +1,632 @@
+---
+title: "Modelos"
+author: "Pedro Henrique Araujo"
+date: "November 6, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Olhar artigo: "classificação morfologica de galaxias em conjuntos de dados desbalanceados" PT!
+
+```{r packages}
+suppressWarnings(suppressMessages(library(dplyr)))
+suppressWarnings(suppressMessages(library(plotly)))
+suppressWarnings(suppressMessages(library(ROCR)))
+suppressWarnings(suppressMessages(library(ggplot2)))
+suppressWarnings(suppressMessages(library(caret)))
+suppressWarnings(suppressMessages(library(rpart)))
+suppressWarnings(suppressMessages(library(rpart.plot)))
+suppressWarnings(suppressMessages(library(randomForest)))
+suppressWarnings(suppressMessages(library(e1071)))
+suppressWarnings(suppressMessages(library(stringr)))
+suppressWarnings(suppressMessages(library(lubridate)))
+suppressWarnings(suppressMessages(library(tm)))
+suppressWarnings(suppressMessages(library(rms)))
+suppressWarnings(suppressMessages(library(glmnet)))
+suppressWarnings(suppressMessages(library(pROC)))
+suppressWarnings(suppressMessages(library(kernlab)))
+suppressWarnings(suppressMessages(library(tree)))
+suppressWarnings(suppressMessages(library(readr)))
+suppressWarnings(suppressMessages(library(ipred)))
+suppressWarnings(suppressMessages(library(xtable)))
+
+setwd("~/Dropbox/ENACOM/Monografia/scripts")
+```
+
+Estatística F1.
+### Data
+Train, validation and test datasets:
+```{r}
+set.seed(198293)
+data <- readRDS('./final_data.rds')
+write.csv(data, file='./final_data.csv')
+original_data <- readRDS('./../data/complete_data.rds')
+
+rmv <- c('sec_app_earliest_cr_line', 'sub_grade', 'addr_state',
+         'payment_plan_start_date', 'debt_settlement_flag_date',
+         'settlement_date', 'hardship_end_date', 'hardship_start_date')
+data <- data %>%
+  select(-rmv)
+foo <- sample(1:nrow(data), size = nrow(data)/3, replace = FALSE)
+test <- data[foo,]
+data <- data[-foo,]
+foo1 <- sample(1:nrow(data), size = nrow(data)/2, replace = FALSE)
+train <- data[foo1, ]
+val <- data[-foo1, ]
+``` 
+
+### Regressão Logística
+Step para seleção de variáveis:
+```{r weight}
+foo <- data %>% group_by(loan_status) %>% summarise(count = n()) %>% data.frame()
+foo$loan_status <- as.character(foo$loan_status)
+a = c('Total', sum(foo$count))
+foo <- rbind(foo, a)
+foo$loan_status <- as.factor(foo$loan_status)
+foo$proportion = c(as.numeric(foo$count[1])/as.numeric(foo$count[3]),
+                   as.numeric(foo$count[2])/as.numeric(foo$count[3]),
+                   as.numeric(foo$count[3])/as.numeric(foo$count[3]))
+w <- NULL
+for(i in 1:nrow(train)){
+  if(train$loan_status[i] == 'Default'){
+    w[i] <- 1/foo$proportion[1]
+  }else if(train$loan_status[i] == 'Fully Paid'){
+    w[i] <- 1/foo$proportion[2]
+  }
+}
+```
+
+```{r lr}
+#null <- glm(data = train, formula = loan_status ~1, family = binomial(link = 'logit'))
+#full <- glm(data = train, formula = loan_status ~., family = binomial(link = 'logit'))
+#step(null, scope=list(lower=null, upper=full), direction="forward")
+
+best <- glm(data = train, 
+            formula = loan_status ~ grade + debt_settlement_flag +
+              hardship_reason + home_ownership,
+            family = binomial(link = 'logit'))
+
+ss <- summary(best)
+tb <- ss$coefficients[,1:2]
+Variable <- rownames(tb)
+df <- data.frame(Variable, tb)
+rownames(df) <- NULL
+colnames(df) <- c('Variável', 'Coeficiente', 'Erro Padrão')
+df$Variável <- as.character(df$Variável)
+df$Variável[1] <- 'Intercepto'
+print(xtable(df), include.rownames = F)
+``` 
+
+Accuracy do modelo final:
+```{r lr.accuracy}
+useful <- c('grade', 'debt_settlement_flag','hardship_reason', 'home_ownership')
+pred <- predict(best, newdata = val[,useful], type = 'response')
+fitted.results <- ifelse(pred >= 0.5 , 'Fully Paid', 'Default')
+lr.mcerror <- mean(fitted.results != val$loan_status)
+print(paste('Accuracy =', 1 - lr.mcerror))
+``` 
+
+```{r lr.confusion}
+fitted.results <- as.factor(fitted.results)
+cm.lr <- confusionMatrix(data = fitted.results, reference = val$loan_status)
+cm.lr <- as.matrix(cm.lr$table)
+tmp <- data.frame(pred = fitted.results, real = val$loan_status)
+defaults <- tmp %>% filter(pred == 'Default', real == 'Default')
+paids <- tmp %>% filter(pred == 'Fully Paid', real == 'Fully Paid')
+dfrate <- nrow(tmp %>% filter(pred == 'Default', 
+                              real == 'Default'))/nrow(tmp%>% filter(real == 'Default'))
+paidrate <- nrow(tmp %>% filter(pred == 'Fully Paid', 
+                    real == 'Fully Paid'))/nrow(tmp%>% filter(real == 'Fully Paid'))
+lr.class.rate <- data.frame(Default = dfrate, Paid = paidrate)
+rownames(lr.class.rate) <- c('Rate')
+
+tb <- cbind(lr.class.rate, 1-lr.mcerror)
+colnames(tb) <- c('Default', 'Fully  Paid', 'Total')
+rownames(tb) <- 'Acurácia'
+print(xtable(tb, digits = 4))
+```
+
+ROC curve e AUC:
+```{r lr.predictions}
+lr.pr <- prediction(pred, val$loan_status)
+rc <- performance(lr.pr, measure = 'tpr', x.measure = 'fpr')
+lr.x <- rc@x.values
+lr.y <- rc@y.values
+lr.z <-rc@alpha.values
+lr.df <- data.frame(lr.x, lr.y, lr.z)
+names(lr.df) <- c('lr.x', 'lr.y', 'lr.z')
+lr.ct <- which.max(1-lr.df$lr.x+lr.df$lr.y)
+
+roc <- roc(loan_status ~ pred, data = val)
+tmp <- cbind(roc$thresholds, (roc$sensitivities + roc$specificities))
+max <- which.max(tmp[,2])
+cutoff <- tmp[max,1]
+
+lr.auc <- performance(lr.pr, measure = 'auc')
+lr.tx <- paste0('AUC = ',round(lr.auc@y.values[[1]],4))
+
+p <- ggplot(lr.df, aes(y = lr.y, x = lr.x)) +
+  geom_line(col = 'blue') +
+  geom_point(aes(x = lr.df$lr.x[lr.ct], y = lr.df$lr.y[lr.ct])) +
+  ggplot2::annotate('text', x=0.8, y=0.5,
+                    label = lr.tx, size = 4.5) +
+  ggplot2::annotate('text', x=lr.df$lr.x[lr.ct]-0.02, y=lr.df$lr.y[lr.ct]+0.06,
+                    label = paste0('Cutoff: ',
+                                   round(cutoff, 4)),
+                    size = 4.5, fontface = 2) +
+  labs(title = "Curva ROC para regressão logística\n",
+       y = 'Sensibilidade', 
+       x = "1-Especificidade") +
+  scale_x_continuous(limits = c(0, 1), expand = c(0,0)) +
+  scale_y_continuous(limits = c(0, 1.05), expand = c(0,0)) +
+  geom_abline(intercept = 0, slope = 1) + 
+  theme_classic() +
+  theme(axis.text=element_text(size=12,  family="Times News Roman"),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 16, hjust = 0.5), 
+        legend.position = 'none')
+ggplotly(p)
+``` 
+
+Finding the best cutt of point for logistic regression:
+```{r lr.cutoff}
+useful <- c('grade', 'debt_settlement_flag','hardship_reason', 'home_ownership')
+pred <- predict(best, newdata = val[,useful], type = 'response')
+fitted.results <- ifelse(pred >= cutoff , 'Fully Paid', 'Default')
+lr.mcerror <- mean(fitted.results != val$loan_status)
+print(paste('Accuracy =', 1 - mcerror))
+
+fitted.results <- as.factor(fitted.results)
+cm.lr <- confusionMatrix(data = fitted.results, reference = val$loan_status)
+cm.lr <- as.matrix(cm.lr$table)
+tmp <- data.frame(pred = fitted.results, real = val$loan_status)
+defaults <- tmp %>% filter(pred == 'Default', real == 'Default')
+paids <- tmp %>% filter(pred == 'Fully Paid', real == 'Fully Paid')
+dfrate <- nrow(tmp %>% filter(pred == 'Default', 
+                              real == 'Default'))/nrow(tmp%>% filter(real == 'Default'))
+paidrate <- nrow(tmp %>% filter(pred == 'Fully Paid', 
+                    real == 'Fully Paid'))/nrow(tmp%>% filter(real == 'Fully Paid'))
+lr.class.rate1 <- data.frame(Default = dfrate, Paid = paidrate)
+rownames(lr.class.rate1) <- c('Logistic Regression Rate')
+tb <- cbind(lr.class.rate1, 1-lr.mcerror)
+colnames(tb) <- c('Default', 'Fully  Paid', 'Total')
+rownames(tb) <- 'Acurácia'
+print(xtable(tb, digits = 4))
+
+
+#### PARA O BANCO TESTE
+pred.test <- predict(best, newdata = test[,useful], type = 'response')
+fitted.results.test <- ifelse(pred.test >= cutoff , 'Fully Paid', 'Default')
+lr.mcerror.test <- mean(fitted.results.test != test$loan_status)
+fitted.results.test <- as.factor(fitted.results.test)
+cm.lr.test <- confusionMatrix(data = fitted.results.test, reference = test$loan_status)
+cm.lr.test <- as.matrix(cm.lr.test$table)
+tmp <- data.frame(pred = fitted.results.test, real = test$loan_status)
+defaults <- tmp %>% filter(pred == 'Default', real == 'Default')
+paids <- tmp %>% filter(pred == 'Fully Paid', real == 'Fully Paid')
+dfrate <- nrow(tmp %>% filter(pred == 'Default', 
+                              real == 'Default'))/nrow(tmp%>% filter(real == 'Default'))
+paidrate <- nrow(tmp %>% filter(pred == 'Fully Paid', 
+                    real == 'Fully Paid'))/nrow(tmp%>% filter(real == 'Fully Paid'))
+lr.class.rate.test <- data.frame(Default = dfrate, Paid = paidrate)
+rownames(lr.class.rate.test) <- c('Rate')
+
+tb1 <- cbind(lr.class.rate.test, 1-lr.mcerror.test)
+colnames(tb1) <- colnames(tb)
+tb2 <- rbind(tb, tb1)
+rownames(tb2) <- c('Validação', 'Teste')
+print(xtable(tb2, digits = 4))
+```
+
+### Decision Tree
+```{r decision_tree}
+tree <- rpart(loan_status ~., data = train, method = 'class')
+x11()
+rpart.plot(tree, main = 'Árvore de Decisão')
+```
+
+```{r dt.accuracy}
+y <- which(names(train) == 'loan_status')
+predito <- predict(tree, newdata = val[,-y], type = 'p')
+pred <- ifelse(predito[,2] >= 0.5, 'Fully Paid', 'Default')
+pred <- as.factor(pred)
+mcerror <- mean(pred != val[,y])
+print(paste('Accuracy =', 1 - mcerror))
+```
+
+```{r dt.confusion}
+cm.dt <- confusionMatrix(data = pred, reference = val$loan_status)
+cm.dt <- as.matrix(cm.dt$table)
+tmp <- data.frame(pred = pred, real = val$loan_status)
+defaults <- tmp %>% filter(pred == 'Default', real == 'Default')
+paids <- tmp %>% filter(pred == 'Fully Paid', real == 'Fully Paid')
+dfrate <- nrow(tmp %>% filter(pred == 'Default', 
+                              real == 'Default'))/nrow(tmp%>% filter(real == 'Default'))
+paidrate <- nrow(tmp %>% filter(pred == 'Fully Paid', 
+                    real == 'Fully Paid'))/nrow(tmp%>% filter(real == 'Fully Paid'))
+dt.class.rate <- data.frame(Default = dfrate, Paid = paidrate)
+rownames(dt.class.rate) <- c('Rate')
+dt.class.rate
+```
+
+ROC curve e AUC:
+```{r dt.predictions}
+dt.pr <- prediction(predito[,2], val$loan_status)
+rc <- performance(dt.pr, measure = 'tpr', x.measure = 'fpr', window.size = 10)
+dt.x <- rc@x.values
+dt.y <- rc@y.values
+dt.z <-rc@alpha.values
+dt.df <- data.frame(dt.x,dt.y,dt.z)
+names(dt.df) <- c('dt.x', 'dt.y', 'dt.z')
+dt.ct <- which.max(1-dt.df$dt.x+dt.df$dt.y)
+
+roc <- roc(loan_status ~ predito[,2], data = val)
+tmp <- cbind(roc$thresholds, (roc$sensitivities + roc$specificities))
+max <- which.max(tmp[,2])
+cutoff <- tmp[max,1]
+
+dt.auc <- performance(dt.pr, measure = 'auc')
+dt.tx <- paste0('AUC = ',round(dt.auc@y.values[[1]],4))
+
+p <- ggplot(dt.df, aes(y = dt.y, x = dt.x)) +
+  geom_line(col = 'blue') +
+  geom_point(aes(x = dt.df$dt.x[dt.ct], y = dt.df$dt.y[dt.ct])) +
+  ggplot2::annotate('text', x=0.8, y=0.5,
+                    label = dt.tx, size = 4.5) +
+  ggplot2::annotate('text', x=dt.df$dt.x[dt.ct]-0.02, y=dt.df$dt.y[dt.ct]+0.06,
+                    label = paste0('Cutoff: ',
+                                   round(cutoff, 4)),
+                    size = 4.5, fontface = 2) +
+  labs(title = "Curva ROC para árvore de decisão\n",
+       y = 'Sensibilidade', 
+       x = "1-Especificidade") +
+  scale_x_continuous(limits = c(0, 1), expand = c(0,0)) +
+  scale_y_continuous(limits = c(0, 1.05), expand = c(0,0)) +
+  geom_abline(intercept = 0, slope = 1) + 
+  theme_classic() +
+  theme(axis.text=element_text(size=12,  family="Times News Roman"),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 16, hjust = 0.5), 
+        legend.position = 'none')
+ggplotly(p)
+``` 
+
+
+```{r dt.cutoff}
+fitted.results <- ifelse(predito[,2] >= cutoff , 'Fully Paid', 'Default')
+dt.mcerror <- mean(fitted.results != val$loan_status)
+print(paste('Accuracy =', 1 - mcerror))
+
+fitted.results <- as.factor(fitted.results)
+cm.dt <- confusionMatrix(data = fitted.results, reference = val$loan_status)
+cm.dt <- as.matrix(cm.dt$table)
+tmp <- data.frame(pred = fitted.results, real = val$loan_status)
+defaults <- tmp %>% filter(pred == 'Default', real == 'Default')
+paids <- tmp %>% filter(pred == 'Fully Paid', real == 'Fully Paid')
+dfrate <- nrow(tmp %>% filter(pred == 'Default', 
+                              real == 'Default'))/nrow(tmp%>% filter(real == 'Default'))
+paidrate <- nrow(tmp %>% filter(pred == 'Fully Paid', 
+                    real == 'Fully Paid'))/nrow(tmp%>% filter(real == 'Fully Paid'))
+dt.class.rate <- data.frame(Default = dfrate, Paid = paidrate)
+rownames(dt.class.rate) <- c('Decision Tree Rate')
+dt.class.rate
+
+
+#### PARA O BANCO TESTE
+pred.test <- predict(tree, newdata = test[,-y], type = 'prob')
+fitted.results.test <- ifelse(pred.test[,2] >= cutoff , 'Fully Paid', 'Default')
+fitted.results.test <- as.factor(fitted.results.test)
+dt.mcerror.test <- mean(fitted.results.test != test$loan_status)
+cm.dt.test <- confusionMatrix(data = fitted.results.test, reference = test$loan_status)
+cm.dt.test <- as.matrix(cm.dt.test$table)
+tmp <- data.frame(pred = fitted.results.test, real = test$loan_status)
+defaults <- tmp %>% filter(pred == 'Default', real == 'Default')
+paids <- tmp %>% filter(pred == 'Fully Paid', real == 'Fully Paid')
+dfrate <- nrow(tmp %>% filter(pred == 'Default', 
+                              real == 'Default'))/nrow(tmp%>% filter(real == 'Default'))
+paidrate <- nrow(tmp %>% filter(pred == 'Fully Paid', 
+                    real == 'Fully Paid'))/nrow(tmp%>% filter(real == 'Fully Paid'))
+dt.class.rate.test <- data.frame(Default = dfrate, Paid = paidrate)
+rownames(dt.class.rate.test) <- c('Rate')
+
+tb1=cbind(dt.class.rate, 1-dt.mcerror)
+tb2=cbind(dt.class.rate.test, 1-dt.mcerror.test)
+colnames(tb1)=colnames(tb2)
+
+tb=rbind(tb1,tb2)
+colnames(tb)=c('Default', 'Fully Paid', 'Total')
+rownames(tb)=c('Validação', 'Teste')
+print(xtable(tb, digits = 4))
+```
+
+### Random Forests
+```{r random_forest}
+ajuste = randomForest(x = train[,-y], y = train[, y], mtry = 8, ntree = 350)
+varImpPlot(ajuste, main = 'Importância das Variáveis')
+``` 
+
+```{r rf.accuracy}
+predito = predict(ajuste, newdata = val[,-y], type = 'p')
+pred <- ifelse(predito[,2] >= 0.5, 'Fully Paid', 'Default')
+pred <- as.factor(pred)
+mcerror <- mean(pred != val[,y])
+print(paste('Accuracy =', 1 - mcerror))
+``` 
+
+```{r rf.confusion}
+cm.rf <- confusionMatrix(data = pred, reference = val$loan_status)
+cm.rf <- as.matrix(cm.rf$table)
+tmp <- data.frame(pred = predito, real = val$loan_status)
+defaults <- tmp %>% filter(pred == 'Default', real == 'Default')
+paids <- tmp %>% filter(pred == 'Fully Paid', real == 'Fully Paid')
+dfrate <- nrow(tmp %>% filter(pred == 'Default', 
+                              real == 'Default'))/nrow(tmp%>% filter(real == 'Default'))
+paidrate <- nrow(tmp %>% filter(pred == 'Fully Paid', 
+                    real == 'Fully Paid'))/nrow(tmp%>% filter(real == 'Fully Paid'))
+rf.class.rate <- data.frame(Default = dfrate, Paid = paidrate)
+rownames(rf.class.rate) <- c('Rate')
+rf.class.rate
+```
+
+ROC curve e AUC:
+```{r dt.predictions}
+rf.pr <- prediction(predito[,2], val$loan_status)
+rc <- performance(rf.pr, measure = 'tpr', x.measure = 'fpr')
+rf.x <- rc@x.values
+rf.y <- rc@y.values
+rf.z <-rc@alpha.values
+rf.df <- data.frame(rf.x,rf.y,rf.z)
+names(rf.df) <- c('rf.x', 'rf.y', 'rf.z')
+rf.ct <- which.max(1-rf.df$rf.x+rf.df$rf.y)
+
+roc <- roc(loan_status ~ predito[,2], data = val)
+tmp <- cbind(roc$thresholds, (roc$sensitivities + roc$specificities))
+max <- which.max(tmp[,2])
+cutoff <- tmp[max,1]
+
+rf.auc <- performance(rf.pr, measure = 'auc')
+rf.tx <- paste0('AUC = ',round(rf.auc@y.values[[1]],4))
+
+p <- ggplot(rf.df, aes(y = rf.y, x = rf.x)) +
+  geom_line(col = 'blue') +
+  geom_point(aes(x = rf.df$rf.x[rf.ct], y = rf.df$rf.y[rf.ct])) +
+  ggplot2::annotate('text', x=0.8, y=0.5,
+                    label = rf.tx, size = 4.5) +
+  ggplot2::annotate('text', x=rf.df$rf.x[rf.ct]-0.02, 
+                    y=rf.df$rf.y[rf.ct]+0.06,
+                    label = paste0('Cutoff: ',
+                                   round(cutoff, 4)),
+                    size = 4.5, fontface = 2) +
+  labs(title = "Curva ROC para Floresta Aleatória\n",
+       y = 'Sensibilidade', 
+       x = "1-Especificidade") +
+  scale_x_continuous(limits = c(0, 1), expand = c(0,0)) +
+  scale_y_continuous(limits = c(0, 1.05), expand = c(0,0)) +
+  geom_abline(intercept = 0, slope = 1) + 
+  theme_classic() +
+  theme(axis.text=element_text(size=12,  family="Times News Roman"),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 16, hjust = 0.5), 
+        legend.position = 'none')
+ggplotly(p)
+``` 
+
+```{r rf.cutoff}
+fitted.results <- ifelse(predito[,2] >= cutoff , 'Fully Paid', 'Default')
+rf.mcerror <- mean(fitted.results != val$loan_status)
+print(paste('Accuracy =', 1 - mcerror))
+
+fitted.results <- as.factor(fitted.results)
+cm.rf <- confusionMatrix(data = fitted.results, reference = val$loan_status)
+cm.rf <- as.matrix(cm.rf$table)
+tmp <- data.frame(pred = fitted.results, real = val$loan_status)
+defaults <- tmp %>% filter(pred == 'Default', real == 'Default')
+paids <- tmp %>% filter(pred == 'Fully Paid', real == 'Fully Paid')
+dfrate <- nrow(tmp %>% filter(pred == 'Default', 
+                              real == 'Default'))/nrow(tmp%>% filter(real == 'Default'))
+paidrate <- nrow(tmp %>% filter(pred == 'Fully Paid', 
+                    real == 'Fully Paid'))/nrow(tmp%>% filter(real == 'Fully Paid'))
+rf.class.rate <- data.frame(Default = dfrate, Paid = paidrate)
+rownames(rf.class.rate) <- c('Random Forest Rate')
+rf.class.rate
+
+
+#### PARA O BANCO TESTE
+pred.test <- predict(ajuste, newdata = test[,-y], type = 'prob')
+fitted.results.test <- ifelse(pred.test[,2] >= cutoff , 'Fully Paid', 'Default')
+fitted.results.test <- as.factor(fitted.results.test)
+rf.mcerror.test <- mean(fitted.results.test != test$loan_status)
+cm.rf.test <- confusionMatrix(data = fitted.results.test, reference = test$loan_status)
+cm.rf.test <- as.matrix(cm.rf.test$table)
+tmp <- data.frame(pred = fitted.results.test, real = test$loan_status)
+defaults <- tmp %>% filter(pred == 'Default', real == 'Default')
+paids <- tmp %>% filter(pred == 'Fully Paid', real == 'Fully Paid')
+dfrate <- nrow(tmp %>% filter(pred == 'Default', 
+                              real == 'Default'))/nrow(tmp%>% filter(real == 'Default'))
+paidrate <- nrow(tmp %>% filter(pred == 'Fully Paid', 
+                    real == 'Fully Paid'))/nrow(tmp%>% filter(real == 'Fully Paid'))
+rf.class.rate.test <- data.frame(Default = dfrate, Paid = paidrate)
+rownames(rf.class.rate.test) <- c('Rate')
+
+tb1=cbind(rf.class.rate, 1-rf.mcerror)
+tb2=cbind(rf.class.rate.test, 1-rf.mcerror.test)
+colnames(tb1)=colnames(tb2)
+
+tb=rbind(tb1,tb2)
+colnames(tb)=c('Default', 'Fully Paid', 'Total')
+rownames(tb)=c('Validação', 'Teste')
+print(xtable(tb, digits = 4))
+```
+
+### SVM
+```{r 1SVM}
+#Mesmo resultado se usarmos cost = gamma = 1
+tune.out = svm(loan_status ~., data = train, scale = TRUE,
+               cost = 0.1,
+               gamma = 0.01, probability = T)
+
+tune.out = svm(loan_status ~., data = train, scale = TRUE,
+               cost = 0.1,
+               gamma = 0.01, class.weights = c('Fully Paid' = unique(w)[1],
+                                               'Default' = unique(w)[2]))
+```
+
+```{r accuracy}
+predito = predict(tune.out, newdata = val[,-y])
+pred <- ifelse(attr(predito, "probabilities")[,1] >= 0.5,
+               'Fully Paid', 'Default')
+pred <- as.factor(pred)
+mcerror <- mean(pred != val[,y])
+print(paste('Accuracy =', 1 - mcerror))
+```
+
+```{r svm.confusion}
+cm.svm <- confusionMatrix(data = pred, reference = val$loan_status)
+cm.svm <- as.matrix(cm.svm$table)
+tmp <- data.frame(pred = pred, real = val$loan_status)
+defaults <- tmp %>% filter(pred == 'Default', real == 'Default')
+paids <- tmp %>% filter(pred == 'Fully Paid', real == 'Fully Paid')
+dfrate <- nrow(tmp %>% filter(pred == 'Default', 
+                              real == 'Default'))/nrow(tmp%>% filter(real == 'Default'))
+paidrate <- nrow(tmp %>% filter(pred == 'Fully Paid', 
+                    real == 'Fully Paid'))/nrow(tmp%>% filter(real == 'Fully Paid'))
+svm.class.rate <- data.frame(Default = dfrate, Paid = paidrate)
+rownames(svm.class.rate) <- c('SVM Rate')
+svm.class.rate
+```
+
+ROC curve e AUC:
+```{r dt.predictions}
+svm.pr = prediction(attr(predito, "probabilities")[,1],
+                    val$loan_status)
+rc <- performance(svm.pr, measure = 'tpr', x.measure = 'fpr')
+svm.x <- rc@x.values
+svm.y <- rc@y.values
+svm.z <-rc@alpha.values
+svm.df <- data.frame(svm.x, svm.y, svm.z)
+names(svm.df) <- c('svm.x', 'svm.y', 'svm.z')
+svm.ct <- which.max(1-svm.df$svm.x+svm.df$svm.y)
+
+roc <- roc(loan_status ~ attr(predito, "probabilities")[,1], data = val)
+tmp <- cbind(roc$thresholds, (roc$sensitivities + roc$specificities))
+max <- which.max(tmp[,2])
+cutoff <- tmp[max,1]
+
+svm.auc <- performance(svm.pr, measure = 'auc')
+tx <- paste0('AUC = ',round(svm.auc@y.values[[1]],4))
+
+p <- ggplot(svm.df, aes(y = svm.y, x = svm.x)) +
+  geom_line(col = 'blue') +
+  geom_point(aes(x = svm.df$svm.x[svm.ct], y = svm.df$svm.y[svm.ct])) +
+  ggplot2::annotate('text', x=0.8, y=0.5,
+                    label = tx, size = 4.5) +
+  ggplot2::annotate('text', x=svm.df$svm.x[svm.ct]-0.02,
+                    y=svm.df$svm.y[svm.ct]+0.06,
+                    label = paste0('Cutoff: ',
+                                   round(cutoff, 4)),
+                    size = 4.5, fontface = 2) +
+  labs(title = "Curva ROC para SVM\n",
+       y = 'Sensibilidade', 
+       x = "1-Especificidade") +
+  scale_x_continuous(limits = c(0, 1), expand = c(0,0)) +
+  scale_y_continuous(limits = c(0, 1.05), expand = c(0,0)) +
+  geom_abline(intercept = 0, slope = 1) + 
+  theme_classic() +
+  theme(axis.text=element_text(size=12,  family="Times News Roman"),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 16, hjust = 0.5), 
+        legend.position = 'none')
+ggplotly(p)
+``` 
+
+
+```{r svm.cutoff}
+pred <- ifelse(attr(predito, "probabilities")[,1] >= cutoff, 
+               'Fully Paid', 'Default')
+pred <- as.factor(pred)
+svm.mcerror <- mean(pred != val$loan_status)
+
+cm.svm <- confusionMatrix(data = pred, reference = val$loan_status)
+cm.svm <- as.matrix(cm.svm$table)
+tmp <- data.frame(pred = pred, real = val$loan_status)
+defaults <- tmp %>% filter(pred == 'Default', real == 'Default')
+paids <- tmp %>% filter(pred == 'Fully Paid', real == 'Fully Paid')
+dfrate <- nrow(tmp %>% filter(pred == 'Default', 
+                              real == 'Default'))/nrow(tmp%>% filter(real == 'Default'))
+paidrate <- nrow(tmp %>% filter(pred == 'Fully Paid', 
+                    real == 'Fully Paid'))/nrow(tmp%>% filter(real == 'Fully Paid'))
+svm.class.rate <- data.frame(Default = dfrate, Paid = paidrate)
+rownames(svm.class.rate) <- c('SVM Rate')
+svm.class.rate
+
+#### PARA O BANCO TESTE
+pred.test <- predict(tune.out, newdata = test[,-y], probability = T,
+                     decision.values = T)
+fitted.results.test <- ifelse(attr(pred.test, "probabilities")[,1] >= cutoff,
+                              'Fully Paid', 'Default')
+fitted.results.test <- as.factor(fitted.results.test)
+svm.mcerror.test <- mean(fitted.results.test != test$loan_status)
+cm.svm.test <- confusionMatrix(data = fitted.results.test,
+                               reference = test$loan_status)
+cm.svm.test <- as.matrix(cm.svm.test$table)
+tmp <- data.frame(pred = fitted.results.test, real = test$loan_status)
+defaults <- tmp %>% filter(pred == 'Default', real == 'Default')
+paids <- tmp %>% filter(pred == 'Fully Paid', real == 'Fully Paid')
+dfrate <- nrow(tmp %>% filter(pred == 'Default', 
+                              real == 'Default'))/nrow(tmp%>% filter(real == 'Default'))
+paidrate <- nrow(tmp %>% filter(pred == 'Fully Paid', 
+                    real == 'Fully Paid'))/nrow(tmp%>% filter(real == 'Fully Paid'))
+svm.class.rate.test <- data.frame(Default = dfrate, Paid = paidrate)
+rownames(svm.class.rate.test) <- c('Rate')
+
+tb1=cbind(svm.class.rate, 1-svm.mcerror)
+tb2=cbind(svm.class.rate.test, 1-svm.mcerror.test)
+colnames(tb1)=colnames(tb2)
+
+tb=rbind(tb1,tb2)
+colnames(tb)=c('Default', 'Fully Paid', 'Total')
+rownames(tb)=c('Validação', 'Teste')
+print(xtable(tb, digits = 4))
+```
+
+### Comparações
+
+```{r comparisons}
+df <- data.frame(lr.df, dt.df, rf.df, svm.df)
+p <- ggplot(df, aes(y = svm.y, x = svm.x), col = 'blue') +
+  geom_line(aes(y = lr.y, x = lr.x), col = 'red') +
+  geom_line(aes(y = dt.y, x = dt.x), col = 'green') +
+  geom_line(aes(y = rf.y, x = rf.x), col = 'orange') +
+  labs(title = "Curvas ROC\n",
+       y = 'Sensibilidade', 
+       x = "1-Especificidade") +
+  scale_x_continuous(limits = c(0, 1), expand = c(0,0)) +
+  scale_y_continuous(limits = c(0, 1.05), expand = c(0,0)) +
+  geom_abline(intercept = 0, slope = 1) + 
+  theme_classic() +
+  theme(axis.text=element_text(size=12,  family="Times News Roman"),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 16, hjust = 0.5))
+p
+
+aucs <- data.frame(lr.auc, dt.auc, rf.auc, svm.auc)
+```
+
+### Análise de Valor
+
+
+```{r}
+lr.table <- rbind(cbind(lr.class.rate, 1-lr.mcerror),
+                  cbind(lr.class.rate.test, 1-lr.mcerror.test))
+dt.table <- rbind(cbind(dt.class.rate, 1-dt.mcerror),
+                  cbind(dt.class.rate.test, 1-dt.mcerror.test))
+rf.table <- rbind(cbind(rf.class.rate, 1-rf.mcerror),
+                  cbind(rf.class.rate.test, 1-rf.mcerror.test))
+svm.table <- rbind(cbind(svm.class.rate, 1-svm.mcerror),
+                  cbind(svm.class.rate.test, 1-svm.mcerror.test))
+```
+
+

@@ -1,0 +1,339 @@
+---
+title: "First_analysis"
+author: "Pedro Araujo"
+date: "October 17, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, include = TRUE, warning = FALSE)
+```
+
+```{r dataandpackages}
+#load all required package
+suppressWarnings(suppressMessages(library(dplyr)))
+suppressWarnings(suppressMessages(library(plotly)))
+suppressWarnings(suppressMessages(library(ggplot2)))
+suppressWarnings(suppressMessages(library(caret)))
+suppressWarnings(suppressMessages(library(corrplot)))
+suppressWarnings(suppressMessages(library(stringr)))
+suppressWarnings(suppressMessages(library(lubridate)))
+suppressWarnings(suppressMessages(library(tm)))
+suppressWarnings(suppressMessages(library(rms)))
+suppressWarnings(suppressMessages(library(glmnet)))
+suppressWarnings(suppressMessages(library(readr)))
+suppressWarnings(suppressMessages(library(visdat)))
+
+
+#make the analysis reproducible
+set.seed(100)
+
+data_original <- readRDS('./../data/complete_data.rds')
+data <- data_original
+``` 
+
+### Data First Analysis
+
+Apenas empréstimos finalizados:
+
+```{r status_count}
+data <- data %>%
+  filter(loan_status != 'Current' & loan_status != '' & loan_status != 'In Grace Period')
+
+data %>% group_by(loan_status) %>% summarise(count = n())
+
+data$loan_status = ifelse(str_detect(data$loan_status, "Paid"),
+                          data$loan_status, "Default")
+
+tmp <- data %>% 
+  group_by(loan_status) %>% 
+  summarise(ncount = n())
+tmp$ncount <- 100 * tmp$ncount/nrow(data)
+tmp$ncount_p <- str_c(round(tmp$ncount, 2), "%")
+
+##plot
+p <- ggplot(tmp, aes(x = loan_status, y = ncount, fill = loan_status)) + 
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = ncount_p), size =4.5) + 
+  labs(title = "Distribuição de acordo com pagamento",
+       x = '', 
+       y = "Proporção(%)") +
+  theme_classic()+
+  theme(axis.text=element_text(size=12,  family="Times News Roman"),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 16, hjust = 0.5), 
+        legend.position = 'none')
+hide_legend(ggplotly(p, tooltip = c('size')))
+```
+
+Analisando default_rate e interest_rate por grade:
+
+```{r int_rate}
+data$int_rate = (as.numeric(gsub(pattern = "%", replacement = "", x = data$int_rate)))
+
+data$issue_y = as.numeric(sapply(data$issue_d, function(x){str_split(x,"-")[[1]][2]}))
+
+displayInterestByGrade <- function(dt){
+    g1 = dt %>% 
+      filter(loan_status == "Default") %>%
+      group_by(grade) %>%
+      summarise(default_count = n())
+    g2 = dt %>%
+      group_by(grade) %>%
+      summarise(count = n(), int_rate = mean(int_rate))
+    g2 %>% 
+      left_join(g1) %>% 
+      mutate(default_rate = 100*default_count/count) %>%
+      select(grade, count, default_count, int_rate, default_rate)
+}
+
+tmp0 = displayInterestByGrade(data %>% filter(issue_y == 2017))
+tmp0$year = 2017
+tmp1 = displayInterestByGrade(data %>% filter(issue_y == 2018))
+tmp1$year = 2018
+
+tmp <- rbind(tmp0, tmp1)
+
+p <- ggplot(tmp, aes(x = grade, y = default_rate, fill = as.factor(year))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Inadimplência por grade e ano",
+       x = 'Grade', 
+       y = "Taxa de inadimplência (%)", legend = 'ano') +
+  theme_classic() +
+  theme(axis.text=element_text(size=12,  family="Times News Roman"),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        plot.title = element_text(size = 16, hjust = 0.5))
+ggplotly(p) %>%
+  layout(legend = list(orientation = 'v', x = 0.15))
+```
+
+Return of investiment:
+```{r all_ROI}
+all_roi = sum(data$total_pymnt)/sum(data$funded_amnt) - 1
+all_roi
+```
+
+ROI para 2017:
+```{r ROI2017}
+roi_2017 = sum((data %>% 
+                 filter(issue_y==2017))$total_pymnt)/sum((data %>%
+                                                            filter(issue_y==2017))$funded_amnt) - 1
+roi_2017
+```
+
+ROI para 2018:
+```{r ROI2018}
+roi_2018 = sum((data %>% 
+                 filter(issue_y==2018))$total_pymnt)/sum((data %>%
+                                                            filter(issue_y==2018))$funded_amnt) - 1
+roi_2018
+```
+
+ROI por grade:
+```{r grades_ROI}
+data$prediction = "Fully Paid"
+createPerformanceTable <- function(dt){
+    
+    dt_pick = dt %>%
+      filter(prediction == "Fully Paid")
+    all_roi = sum(dt_pick$total_pymnt)/sum(dt_pick$funded_amnt) - 1
+
+    temp_table = data.frame(grade = character(0),
+                            roi = numeric(0),
+                            percent_pick = numeric(0))
+    for(g in c("A","B","C","D","E","F","G")){
+        data_pick_grade = dt_pick %>% filter(grade == g)
+        if(nrow(data_pick_grade) == 0){
+            temp_table = rbind(temp_table, 
+                               data.frame(grade = g,
+                                          roi = 0,
+                                          percent_pick = 0))
+        }
+        else{
+          data_grade = dt %>% 
+            filter(grade == g)
+          roi = sum(data_pick_grade$total_pymnt)/sum(data_pick_grade$funded_amnt) - 1
+          temp_table = rbind(temp_table,
+                             data.frame(grade = g,
+                                        roi = roi,
+                                        percent_pick = 100 * nrow(data_pick_grade)/nrow(data_grade)))
+        }
+    }
+    
+    temp_table = rbind(temp_table,
+                       data.frame(grade = "ALL",
+                                  roi = all_roi,
+                                  percent_pick = 100 * nrow(dt_pick)/nrow(dt)))
+    return(temp_table)
+}
+
+baseline_table = createPerformanceTable(data %>% filter(issue_y==2017))
+baseline_table
+```
+
+### Feature Engineering
+
+Apenas colunas com proporção de NA's menor ou igual a 0.5.
+```{r na_proportion}
+discard_column = c("collection_recovery_fee","emp_title",
+                   "funded_amnt_inv","id","last_credit_pull_d",
+                   "last_fico_range_high","last_fico_range_low",
+                   "last_pymnt_amnt","last_pymnt_d","member_id",
+                   "next_pymnt_d","num_tl_120dpd_2m",
+                   "num_tl_30dpd","out_prncp",
+                   "out_prncp_inv","recoveries",
+                   "total_pymnt","total_pymnt_inv",
+                   "total_rec_int","total_rec_late_fee",
+                   "total_rec_prncp","url",
+                   "zip_code")
+
+data = (data[, !(names(data) %in% discard_column)])
+#vis_dat(data, warn_large_data = F)
+tmp = sort(sapply(data, function(x) sum(length(which(is.na(x)))))/nrow(data),
+           decreasing = TRUE)
+
+discard_column = names(tmp[tmp>0.5])
+data = (data[,!(names(data) %in% discard_column)])
+```
+
+Inputação pela mediana:
+```{r fe_medianinput}
+tmp = sort(sapply(data, function(x) sum(length(which(is.na(x)))))/nrow(data),
+           decreasing = TRUE)
+
+tmp = tmp[tmp>0]
+setEPS()
+postscript('hist.eps')
+par(mfrow = c(4,3))
+for(feature_name in names(tmp)){
+    hist(data[[feature_name]],
+         main = str_c(feature_name,
+                      "(missing=",
+                      100* round(as.numeric(tmp[feature_name]), 2), "%)"),
+         xlab = 'Valores', ylab = 'Frequencia')
+}
+dev.off()
+par(mfrow = c(1,1))
+
+median_impute_model = preProcess(data[names(tmp)],
+                                 method = "medianImpute")
+data = predict(median_impute_model, data)
+
+sort(sapply(data, function(x) sum(length(which(is.na(x)))))/nrow(data),
+     decreasing = TRUE)
+```
+
+Eliminando colunas com variância nula ou factors com uma classe:
+```{r fe_null_variance}
+data$revol_util = (as.numeric(gsub(pattern = "%",
+                                    replacement = "",
+                                    x = data$int_rate)))
+
+data$earliest_cr_line = parse_date_time(str_c("01", data$issue_d),"dmy" ) -
+  parse_date_time(str_c("01", data$earliest_cr_line),"dmy")
+data$earliest_cr_line = as.numeric(data$earliest_cr_line, units = "days")
+
+
+data$issue_m = sapply(data$issue_d, function(x){str_split(x,"-")[[1]][1]})
+
+getNumericColumns<-function(t){
+    tn = sapply(t, function(x){is.numeric(x)})
+    return(names(tn)[which(tn)])
+}
+
+getCharColumns<-function(t){
+    tn = sapply(t,function(x){is.character(x)})
+    return(names(tn)[which(tn)])
+}
+
+getFactorColumns<-function(t){
+    tn = sapply(t,function(x){is.factor(x)})
+    return(names(tn)[which(tn)])
+}
+
+getIndexsOfColumns <- function(t,column_names){
+    return(match(column_names,colnames(t)))
+}
+
+tmp = apply(data[getCharColumns(data)], 2, function(x){length(unique(x))})
+tmp = tmp[tmp == 1]
+
+tmp2 = apply(data[getNumericColumns(data)], 2, function(x){(sd(x))})
+tmp2 = tmp2[tmp2 == 0]
+
+discard_column = c(names(tmp), names(tmp2))
+
+data = (data[,!(names(data) %in% discard_column)])
+
+tmp = data %>% 
+  filter(loan_status == "Default") %>% 
+  group_by(issue_m) %>% 
+  summarise(default_count = n())
+tmp2 = data %>%
+  group_by(issue_m) %>% 
+  summarise(count = n())
+tmp2 %>% left_join(tmp) %>% mutate(default_rate = default_count/count)
+
+data$issue_m = NULL
+data$issue_d = NULL
+
+rm(tmp,tmp2)
+```
+
+Correlação das features:
+```{r features_correlation}
+data$desc = NULL
+data$title = NULL
+setEPS()
+postscript('corr.eps', width = 6, height = 6)
+M <- cor(data[getNumericColumns(data)], use = 'na.or.complete')
+corrplot(M, type = 'upper', order = 'hclust',
+         method = 'circle', tl.cex = 0.6, cl.cex = 0.6,
+         tl.col = 'black', diag = FALSE)
+dev.off()
+```
+
+Eliminando features com correlação maior que 0.75:
+```{r high_corr}
+high_corr <- findCorrelation(M, cutoff = .75)
+high_corr <- getNumericColumns(data)[high_corr]
+high_corr <- high_corr[-which(high_corr == 'int_rate' | high_corr == 'loan_amnt')]
+
+data$revol_bal = data$revol_bal/data$funded_amnt
+data$avg_cur_bal = data$avg_cur_bal/data$funded_amnt
+data$bc_open_to_buy = data$bc_open_to_buy/data$funded_amnt
+
+data <- (data[, !(names(data) %in% high_corr)])
+```
+
+Analisando ownership:
+```{r ownership}
+table(data$home_ownership)
+```
+
+Removendo ownership 'NONE':
+```{r ownership_filtering}
+data = data %>%
+  filter(home_ownership != 'NONE')
+```
+
+Remover payment plan porque todos da classe 'y' são 'Default':
+```{r pyment_plan}
+all((data %>% filter(pymnt_plan == "y") %>% select(loan_status)) == 'Default')
+data$pymnt_plan = NULL
+``` 
+
+Transformando characters columns in factors:
+```{r str_analysis}
+factor.names <- getCharColumns(data)
+factor.cols <- data[factor.names]
+factor.cols <- lapply(factor.cols, function(x) as.factor(x))
+
+non.factor.names <- names(data)[(!names(data) %in% factor.names)]
+non.factor.cols <- data[non.factor.names]
+
+data <- data.frame(factor.cols, non.factor.cols)
+str(data)
+saveRDS(data, 'final_data.rds')
+```
